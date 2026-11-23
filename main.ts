@@ -1,21 +1,21 @@
-// Token Radar — the entrypoint (Node 22, standard library only).
+// Token Radar v2 — the entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot, scores the pre-token board with lib/model.ts,
 // and writes everything the gate and the judge read:
 //
-//   /output/board.json     the ranked board (rows)
+//   /output/board.json     { rows: [...] }, the ranked board
 //   /output/data.js        window.RADAR, the dashboard's whole dataset
 //   /output/dashboard/    a copy of this repository's dashboard/
 //   /output/screenshots/  a copy of this repository's screenshots/
-//   /output/dossier.json  buildDossier's summary, written last so it
-//                          matches the files above byte for byte
+//   /output/dossier.json  the vendor buildDossier's summary, written last
+//                          so it matches the files above byte for byte
 //
 // Run it locally with:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
+//   node main.ts --input ../input/snapshot.json --output out
 //
-// The run is deterministic: the same snapshot always writes the same bytes.
-// It refuses to write a board the gate would refuse, and exits 1 with the
-// reason on stderr.
+// The run is deterministic: the same snapshot always writes the same
+// bytes. It refuses to write a board the gate would refuse, and exits 1
+// with the reason on stderr.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -101,6 +101,10 @@ writeFileSync(
 );
 
 process.stdout.write(
-  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${payload.early_size} early, ${payload.live_size} live set aside)\n` +
-    `token radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, ${join(outDir, 'dashboard')} (${dashboardFiles.length} files), ${join(outDir, 'screenshots')} (${shots.length} images) and ${join(outDir, 'dossier.json')}\n`,
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored ` +
+    `(${payload.early_size} early, ${payload.off_list_size} off-list, ${payload.live_size} live set aside)\n` +
+    `token radar: fit n=${payload.fit.n} slope=${payload.fit.slope} R²=${payload.fit.r2} LOO miss ×${payload.fit.looMiss} (flat ×${payload.fit.flatLooMiss}), ` +
+    `odds Brier ${payload.odds.brier} vs base ${payload.odds.brierBase}, verdicts FARM ${payload.verdicts.FARM} / THIN ${payload.verdicts.THIN} / SKIP ${payload.verdicts.SKIP}, ` +
+    `ledger ${payload.ledger_total}/${snapshot.protocols.length}, checksum ${payload.checksum}\n` +
+    `token radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, ${join(outDir, 'dashboard')} (${dashboardFiles.length} files, ${dashboardBytes} bytes), ${join(outDir, 'screenshots')} (${shots.length} images) and ${join(outDir, 'dossier.json')}\n`,
 );
