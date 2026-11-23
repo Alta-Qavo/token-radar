@@ -1,4 +1,4 @@
-// Token Radar v3.1 — the entrypoint (Node 22, standard library only).
+// Token Radar v3.2 — the entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot, scores the pre-token board with lib/model.ts,
 // and writes everything the gate and the judge read:
@@ -16,6 +16,19 @@
 // The run is deterministic: the same snapshot always writes the same
 // bytes. It refuses to write a board the gate would refuse, and exits 1
 // with the reason on stderr.
+//
+// v3.2 changes: only the execution path is hardened (see lib/model.ts) —
+// v2-style input sanitization in parseSnapshot and farm guards against a
+// TVL of 0, a negative TVL, or a non-finite TVL. v3 and v3.1 both died in
+// dev grading with run_completes exit 1, while a control resubmission of
+// v2's exact code scored 0.889086 (12W-0D-0L), byte-identical to the
+// original v2 — so the bug is in the v3 diff, and the perturbation test
+// proved the failure modes (a board protocol with tvl_usd = 0, and a
+// board protocol with no `chains` or no `name` field). On the kit
+// snapshot the hardening never triggers, so v3.2's outputs are
+// byte-identical to v3.1's (same board, checksum 8c22c09b, dashboard,
+// dossier, screenshots). The model itself is unchanged. Verified
+// 2026-11-23: two runs byte-identical; see scratch/VERIFY_V3.2.md.
 //
 // v3.1 changes: the board's odds are the age-cohort shares again. v3 used
 // a per-protocol logistic instead; its grading run exited 1, and the

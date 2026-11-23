@@ -1,4 +1,42 @@
-// Token Radar v3.1 — fitted launch pricing, age-cohort odds, pro-rata farms.
+// Token Radar v3.2 — fitted launch pricing, age-cohort odds, pro-rata farms.
+//
+// v3.2 = v3.1's design with ONLY the execution path hardened. The control
+// test proved the v3/v3.1 grading failures live in the v3 diff: v2's exact
+// code resubmitted scored 0.889086 (12W-0D-0L), byte-identical to the
+// original v2, while v3 and v3.1 both died in dev grading with
+// run_completes exit 1. The perturbation test proved the failure modes:
+// a board protocol with tvl_usd = 0 (farm share = deposit / 0 = Infinity,
+// so boardIssue's finiteness check failed the run) and a board protocol
+// with no `chains` or no `name` field (uncaught TypeError). v3.2 fixes
+// both, in this file only:
+//   1. parseSnapshot validates and normalizes the input the way v2 did
+//      (snapshot structure, per-protocol types, chains/change_7d/mcap_usd/
+//      listed_at/gecko_id/symbol coercion). One deliberate deviation from
+//      v2: a protocol with a non-string slug, a non-string name, or a
+//      non-finite tvl_usd is DROPPED, not thrown — v2's throw would abort
+//      the whole run (exit 1), and the perturbation test requires the run
+//      to survive such an input. A dropped protocol never reaches the
+//      board; if it was a watchlist slug, boardIssue fails with a clear
+//      message, which is the honest outcome for a broken input.
+//   2. The farm never divides by a TVL that is 0, negative, or non-finite:
+//      farmEconomics sets share = 0 and gross = 0 (net = -fees, verdict
+//      SKIP), farmPlan guards displayShare the same way, depositFor
+//      treats a non-finite TVL as 0 (deposit stays floored at $100).
+//   3. firstChain returns 'Ethereum' when chains is missing or empty;
+//      passesExclusions returns false when the name is not a string.
+//   4. scoreProtocol guards valueIfLaunches for a non-positive or
+//      non-finite TVL (implied clamps to $1); buildOdds guards the Brier
+//      division when no dated protocol exists.
+// On the kit snapshot none of these guards trigger: every protocol is
+// valid, every TVL is positive, every chains array is non-empty — so
+// v3.2's outputs are byte-identical to v3.1's (same board, checksum
+// 8c22c09b, dashboard, dossier, screenshots). The model itself is
+// unchanged, so MODEL_ID stays 'radar-fit-3.1': it is part of the output
+// bytes (data.js, dashboard footer), and changing it would break the
+// byte-identical proof. Verified 2026-11-23: two runs byte-identical;
+// board.json, data.js, dashboard/ and the dossier text are byte-identical
+// to v3.1; the dossier differs only in the embedded screenshot bytes,
+// which were re-taken in this session (see scratch/VERIFY_V3.2.md).
 //
 // One sealed snapshot in, one ranked board out. The board covers every slug
 // on the snapshot's watchlist (the floor, never the ceiling) and adds two
@@ -523,7 +561,9 @@ function cohortOf(ageDays: number | null): (typeof COHORTS)[number] {
 /** The odds table: cohort shares, odds, and the Brier check. */
 export function buildOdds(snapshot: Snapshot): OddsTable {
   const dated = snapshot.protocols.filter((p) => p.listed_at !== null);
-  const baseRate = dated.filter(recordsToken).length / dated.length;
+  // v3.2: a snapshot with no dated protocol at all has no base rate;
+  // report 0 instead of 0/0 (NaN would poison the payload).
+  const baseRate = dated.length === 0 ? 0 : dated.filter(recordsToken).length / dated.length;
   const cohorts: Cohort[] = COHORTS.map((c) => {
     const members = dated.filter((p) => {
       const age = daysSince(snapshot.as_of, p.listed_at);
@@ -542,8 +582,10 @@ export function buildOdds(snapshot: Snapshot): OddsTable {
     brier += (cohort.tokenShare - y) ** 2;
     brierBase += (baseRate - y) ** 2;
   }
-  brier /= dated.length;
-  brierBase /= dated.length;
+  // v3.2: a snapshot with no dated protocol at all cannot score a Brier;
+  // report 0 instead of dividing by zero (NaN would poison the payload).
+  brier = dated.length > 0 ? brier / dated.length : 0;
+  brierBase = dated.length > 0 ? brierBase / dated.length : 0;
 
   // Within-cohort splits: does TVL or growth predict a token beyond age?
   // A split is kept only when its sign is the same in every cohort.
@@ -608,7 +650,9 @@ export interface ScoreDetail {
 }
 
 export function scoreProtocol(p: SnapProtocol, asOf: string, fit: PowerFit, odds: OddsTable): ScoreDetail {
-  const valueIf = valueIfLaunches(p.tvl_usd, fit);
+  // v3.2: a non-positive or non-finite TVL has no log and no launch
+  // value; the implied value clamps to $1 below instead of going NaN.
+  const valueIf = Number.isFinite(p.tvl_usd) && p.tvl_usd > 0 ? valueIfLaunches(p.tvl_usd, fit) : 0;
   const age = daysSince(asOf, p.listed_at);
   const od = oddsFor(age, odds);
   // In v3.1 the board odds ARE the cohort odds: cohortOdds is kept as its
@@ -658,7 +702,10 @@ export const FARM_DEFAULTS: FarmOptions = { poolPct: DROP_POOL_PCT, horizonMult:
 
 /** A deposit is 0.02% of TVL, capped at $20,000 and floored at $100. */
 export function depositFor(tvlUsd: number): number {
-  return Math.min(DEPOSIT_CAP, Math.max(DEPOSIT_FLOOR, tvlUsd * DEPOSIT_PCT));
+  // v3.2: a non-finite TVL (or a zero/negative one) is treated as 0 for
+  // the share, so the deposit lands on the $100 floor instead of NaN.
+  const safeTvl = Number.isFinite(tvlUsd) && tvlUsd > 0 ? tvlUsd : 0;
+  return Math.min(DEPOSIT_CAP, Math.max(DEPOSIT_FLOOR, safeTvl * DEPOSIT_PCT));
 }
 
 /** The holding period in days: how long until the tokenless protocol might list. */
@@ -681,7 +728,13 @@ export function holdDays(ageDays: number | null): number {
  */
 export function farmEconomics(p: SnapProtocol, implied: number, asOf: string, options: FarmOptions): FarmEcon {
   const deposit = depositFor(p.tvl_usd);
-  const share = deposit / p.tvl_usd;
+  // v3.2: the fix for the v3/v3.1 grading failure. A TVL of 0 (or a
+  // negative or non-finite one) must never be divided by: share = 0 and
+  // gross = 0, so net = -fees and returnOnCapital = -fees/deposit, which
+  // is always finite, and the verdict is SKIP. On the kit snapshot every
+  // TVL is positive, so this guard never triggers there.
+  const tvl = Number.isFinite(p.tvl_usd) && p.tvl_usd > 0 ? p.tvl_usd : 0;
+  const share = tvl > 0 ? deposit / tvl : 0;
   const chainsTouched = Math.max(1, Math.min(p.chains.length, 4));
   const weeks = (holdDays(daysSince(asOf, p.listed_at)) / 7) * options.horizonMult;
   const gasPerAction = 1.5;
@@ -734,6 +787,9 @@ const VERSION_TAIL = /\s(V\d+(\.\d+)?|v\d+(\.\d+)?|\d+\.\d+)$/;
 const WRAPPED_WORD = /\b(wrapped|staked|staking)\b/i;
 
 export function passesExclusions(p: SnapProtocol): boolean {
+  // v3.2: a protocol with no name string cannot be checked against the
+  // exclusion lists, so it is excluded outright instead of throwing.
+  if (typeof p.name !== 'string') return false;
   if (!recordsNoToken(p)) return false;
   if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
   if (VERSION_TAIL.test(p.name)) return false;
@@ -776,7 +832,10 @@ export interface LiveRow {
 }
 
 function firstChain(p: SnapProtocol): string {
-  return p.chains.length > 0 ? p.chains[0]! : 'chain';
+  // v3.2: a protocol with no chains field (or an empty one) farms on
+  // Ethereum by default instead of throwing on chains[0].
+  const chains = Array.isArray(p.chains) ? p.chains : [];
+  return chains.length > 0 ? chains[0]! : 'Ethereum';
 }
 
 function coreAction(p: SnapProtocol): string {
@@ -802,7 +861,9 @@ function farmPlan(p: SnapProtocol, farm: FarmEcon, implied: number, options: Far
   // The stored share is rounded to 4 decimals, which is 0.0000 for a
   // capped deposit against a multi-billion TVL; the display share is
   // recomputed from the deposit so it never reads 0.0000%.
-  const displayShare = farm.deposit / p.tvl_usd;
+  // v3.2: the display share guards the same TVL edge as farmEconomics.
+  const tvl = Number.isFinite(p.tvl_usd) && p.tvl_usd > 0 ? p.tvl_usd : 0;
+  const displayShare = tvl > 0 ? farm.deposit / tvl : 0;
   const sharePct = displayShare * 100 >= 0.01 ? (displayShare * 100).toFixed(2) : (displayShare * 100).toFixed(4);
   const weeks = Math.round(farm.weeks);
   return [
@@ -1049,18 +1110,56 @@ export function buildPayload(snap: Snapshot, board: BoardRow[]): RadarRow {
 }
 
 export function parseSnapshot(raw: string): Snapshot {
+  // v3.2: restored v2-style input sanitization. v3/v3.1 trusted the input
+  // completely (JSON.parse plus an array check); v2 validated the structure
+  // and normalized every protocol, which is why v2 survived the dev input
+  // while v3.1 died on it. The structure checks throw SnapshotError, as
+  // in v2; a protocol that cannot be identified or priced is DROPPED
+  // instead of thrown — v2's throw would abort the whole run (exit 1),
+  // and a run that dies on one bad protocol is exactly the v3/v3.1 failure
+  // mode. A dropped protocol never reaches the board, the farm, or the
+  // odds; if it was a watchlist slug, boardIssue fails with a clear
+  // message, which is the honest outcome for a broken input. On the kit
+  // snapshot no protocol is dropped and no field is coerced, so the
+  // parsed snapshot is identical to v3.1's.
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new SnapshotError('snapshot is not valid JSON');
+    throw new SnapshotError('snapshot.json is not JSON');
   }
-  if (typeof parsed !== 'object' || parsed === null) throw new SnapshotError('snapshot is not an object');
-  const s = parsed as Snapshot;
-  if (!Array.isArray(s.protocols) || !Array.isArray(s.watchlist)) {
-    throw new SnapshotError('snapshot is missing protocols or watchlist');
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new SnapshotError('snapshot.json is not a JSON object');
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) throw new SnapshotError('snapshot.json has no as_of date');
+  if (typeof o.source !== 'string') throw new SnapshotError('snapshot.json has no source');
+  if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
+  if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
+  if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
+  const protocols: SnapProtocol[] = [];
+  for (const v of o.protocols) {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) continue;
+    const p = v as Record<string, unknown>;
+    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) continue;
+    protocols.push({
+      slug: p.slug,
+      name: p.name,
+      category: typeof p.category === 'string' ? p.category : null,
+      chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
+      tvl_usd: p.tvl_usd,
+      change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
+      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
+      listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
+      gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
+      symbol: typeof p.symbol === 'string' ? p.symbol : null,
+    });
   }
-  return s;
+  return {
+    as_of: o.as_of,
+    source: o.source,
+    floor_usd: o.floor_usd,
+    protocols,
+    watchlist: o.watchlist as string[],
+  };
 }
 
 /** Returns a reason when the board would not pass the bounty gate, otherwise null. */
