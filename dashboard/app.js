@@ -1,10 +1,10 @@
-// Token Radar v3 dashboard. Reads window.RADAR (written beside dashboard/
+// Token Radar v3.1 dashboard. Reads window.RADAR (written beside dashboard/
 // by main.ts) and renders the cover first — one-line headline, ledger bar,
 // one-row KPI strip, the board beside a rail with the scatter and the
 // compact evidence — then the detail view and the full evidence below.
 // No network: every byte shown comes from data.js. Every number the page
 // shows is recomputed in the page from the snapshot figures: implied value
-// from the fitted curve and the logistic odds, farm net from the live
+// from the fitted curve and the age-cohort odds, farm net from the live
 // controls, the checksum from the board. The self-audit chips say whether
 // the recompute matches board.json.
 (function () {
@@ -57,8 +57,16 @@
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
-  function sigmoid(z) { return 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z)))); }
-  function dot(a, b) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+
+  /** The age cohort a protocol's age falls in; unknown age takes the middle cohort. */
+  function cohortOfAge(ageDays) {
+    var age = ageDays === null || ageDays === undefined ? 365 : ageDays;
+    var cohorts = DATA.odds.cohorts;
+    for (var i = 0; i < cohorts.length; i++) {
+      if (age >= cohorts[i].minDays && age <= cohorts[i].maxDays) return cohorts[i];
+    }
+    return cohorts[cohorts.length - 1];
+  }
 
   // --- The recompute mirror: byte-for-byte the same arithmetic as
   // lib/model.ts, so the audit can catch any drift between the page and
@@ -66,14 +74,7 @@
   function impliedOf(r) {
     var fit = DATA.fit;
     var valueIf = Math.pow(10, fit.intercept + fit.slope * Math.log10(r.tvl_usd));
-    var age = r.age_days === null || r.age_days === undefined ? 365 : r.age_days;
-    var growth = typeof r.change_7d === 'number' && isFinite(r.change_7d) ? Math.max(-50, Math.min(100, r.change_7d)) / 100 : 0;
-    var lg = DATA.odds.logistic;
-    var raw = [age / 365, Math.log10(r.tvl_usd), growth];
-    var x = [1];
-    for (var i = 0; i < 3; i++) x.push((raw[i] - lg.mu[i]) / lg.sd[i]);
-    var p = sigmoid(dot(x, lg.beta));
-    var odds = round4(Math.max(0.05, Math.min(0.98, (0.94 - p) / (1 - p))));
+    var odds = cohortOfAge(r.age_days).odds;
     var implied = Math.max(1, Math.round(valueIf * odds));
     var lo = Math.max(1, Math.round(valueIf * Math.pow(10, fit.rangeP25) * odds));
     var hi = Math.max(1, Math.round(valueIf * Math.pow(10, fit.rangeP75) * odds));
@@ -170,8 +171,8 @@
     var W = 320, H = 210, padL = 34, padB = 22, padT = 8, padR = 6;
     var xs = pts.map(function (p) { return Math.log10(p.valueIf); });
     var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
-    // Zoom the odds axis to the board's own range: every row sits between
-    // 0.85 and 0.98, so a 0–1 axis would crush them into one band.
+    // Zoom the odds axis to the board's own range: the five cohort odds
+    // sit between 0.71 and 0.92, so a 0–1 axis would crush them into one band.
     var os = pts.map(function (p) { return p.odds; });
     var loO = Math.max(0, Math.min.apply(null, os) - 0.02);
     var hiO = Math.min(1, Math.max.apply(null, os) + 0.02);
@@ -231,7 +232,6 @@
       var f = farmOf(r, state.poolPct, state.horizonMult);
       var imp = impliedOf(r);
       var pct = Math.max(4, Math.round((imp.implied / maxImplied) * 100));
-      var badge = r.group === 'watchlist' ? 'W' : r.group === 'early' ? 'E' : 'O';
       html += '<tr data-slug="' + esc(r.slug) + '"' + (state.detailSlug === r.slug ? ' class="sel"' : '') + '>'
         + '<td class="num">' + r.rank + '</td>'
         + '<td><b>' + esc(r.name) + '</b></td>'
@@ -254,13 +254,14 @@
     var imp = impliedOf(r);
     var f = farmOf(r, state.poolPct, state.horizonMult);
     var fit = DATA.fit;
+    var cohort = cohortOfAge(r.age_days);
     var row = function (k, v) { return '<dt>' + k + '</dt><dd>' + v + '</dd>'; };
     return '<section class="panel" id="detail"><h2>Detail — ' + esc(r.name) + ' (rank ' + r.rank + ', ' + r.group + ')</h2>'
       + '<p class="fine">' + esc(r.category || 'protocol') + ' · ' + esc(r.chains.join(', ')) + ' · TVL ' + fmtUsd(r.tvl_usd) + ' · 7d ' + fmtPct(r.change_7d) + ' · age ' + fmtAge(r.age_days) + '</p>'
       + '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">'
       + '<div><h3>Model breakdown</h3><dl class="kv">'
       + row('Value if launches', fmtUsd(imp.valueIf) + ' — 10^(' + fit.intercept + ' + ' + fit.slope + ' × log10(' + fmtUsd(r.tvl_usd) + '))')
-      + row('Odds', imp.odds.toFixed(4) + ' — logistic on age, TVL, growth; cohort anchor ' + r.cohort_odds.toFixed(4))
+      + row('Odds', imp.odds.toFixed(4) + ' — age cohort ' + esc(cohort.label) + ', share recording a token ' + cohort.tokenShare.toFixed(4))
       + row('Implied value', '<b>' + fmtUsd(imp.implied) + '</b> = value if × odds')
       + row('Range P25–P75', fmtUsd(imp.lo) + ' – ' + fmtUsd(imp.hi))
       + row('Range P10–P90', fmtUsd(Math.max(1, Math.round(imp.valueIf * Math.pow(10, fit.rangeP10) * imp.odds))) + ' – ' + fmtUsd(Math.max(1, Math.round(imp.valueIf * Math.pow(10, fit.rangeP90) * imp.odds))))
@@ -289,7 +290,7 @@
       return '<tr><td>' + esc(t.term) + '</td><td class="num">×' + t.looMiss + '</td><td class="num">×' + t.wfMiss + '</td><td class="num">×' + t.geoLooMiss + '</td><td class="num">×' + t.geoWfMiss + '</td><td>' + (t.kept ? 'kept' : 'dropped') + '</td><td>' + esc(t.note) + '</td></tr>';
     }).join('');
     var cohortRows = DATA.odds.cohorts.map(function (c) {
-      return '<tr><td>' + esc(c.label) + '</td><td class="num">' + c.n + '</td><td class="num">' + c.share.toFixed(4) + '</td></tr>';
+      return '<tr><td>' + esc(c.label) + '</td><td class="num">' + c.n + '</td><td class="num">' + c.tokenShare.toFixed(4) + '</td><td class="num">' + c.odds.toFixed(4) + '</td></tr>';
     }).join('');
     var liveRows = DATA.live.map(function (r) {
       return '<tr><td class="num">' + r.rank + '</td><td>' + esc(r.name) + '</td><td>' + esc(r.category || 'protocol') + '</td><td class="num">' + fmtUsd(r.tvl_usd) + '</td><td class="num">' + fmtUsd(r.mcap_usd) + '</td></tr>';
@@ -309,9 +310,9 @@
       + '<h3>Extra-term tests — kept only on both tests, both measures</h3>'
       + '<p class="fine">Base curve: log10(mcap) = ' + DATA.fit.intercept + ' + ' + DATA.fit.slope + ' × log10(TVL), R² ' + DATA.fit.r2 + ', n=' + DATA.fit.n + '. LOO ×' + DATA.fit.looMiss + ' and walk-forward ×' + DATA.fit.wfMiss + ' (geometric-mean ×' + DATA.fit.looGeoMiss + ' / ×' + DATA.fit.wfGeoMiss + '). The 128-comparable fit is worse on walk-forward (×' + DATA.fit128.wfMiss + ' vs ×' + DATA.fit.wfMiss + '), so the 94-comparable base stays.</p>'
       + '<table><thead><tr><th>Term</th><th class="num">LOO</th><th class="num">WF</th><th class="num">Geo LOO</th><th class="num">Geo WF</th><th>Kept</th><th>Why</th></tr></thead><tbody>' + termsRows + '</tbody></table>'
-      + '<h3>Odds — age cohorts anchor, logistic spreads</h3>'
-      + '<p class="fine">The logistic (age + log TVL + growth, IRLS, L2=1) on ' + DATA.odds.logistic.n + ' dated protocols: Brier ' + DATA.odds.logistic.brierLoo + ' leave-one-out vs cohort ' + DATA.odds.brierCohort + ' and base ' + DATA.odds.logistic.brierBase + '. It does NOT beat the cohorts on calibration — it is kept because it gives every protocol its own odds (' + DATA.oddsSpread.distinct + ' distinct values; the largest share at one value is ' + Math.round(DATA.oddsSpread.maxShare * 100) + '%) instead of five shared values. Odds = (0.94 − p) / (1 − p), clipped to [0.05, 0.98]. ' + esc(DATA.odds.tvlSplitNote) + ' ' + esc(DATA.odds.growthSplitNote) + '</p>'
-      + '<table><thead><tr><th>Cohort</th><th class="num">n</th><th class="num">Share recording a token</th></tr></thead><tbody>' + cohortRows + '</tbody></table>'
+      + '<h3>Odds — age cohorts</h3>'
+      + '<p class="fine">The odds ARE the age cohorts: on ' + DATA.odds.n + ' dated protocols, each cohort\'s share recording a token is turned into odds = (0.94 − share) / (1 − share), clipped to [0.05, 0.98]. Brier ' + DATA.odds.brier + ' leave-one-out vs base ' + DATA.odds.brierBase + '. Five cohorts, ' + DATA.oddsSpread.distinct + ' distinct odds values; the largest share at one value is ' + Math.round(DATA.oddsSpread.maxShare * 100) + '%. ' + esc(DATA.odds.tvlSplitNote) + ' ' + esc(DATA.odds.growthSplitNote) + '</p>'
+      + '<table><thead><tr><th>Cohort</th><th class="num">n</th><th class="num">Share recording a token</th><th class="num">Odds</th></tr></thead><tbody>' + cohortRows + '</tbody></table>'
       + '<h3>Worked example — rank 1, ' + esc(top1.name) + '</h3>'
       + '<p>Deposit ' + fmtMoney(f1.deposit) + ' (0.02% of ' + fmtUsd(top1.tvl_usd) + ' TVL) is a ' + fmtSharePct(f1.deposit / top1.tvl_usd) + ' share; a 10% drop pool on ' + fmtUsd(top1.implied_value_usd) + ' implied value pays ' + fmtMoney(f1.gross) + ' gross. Gas ' + fmtMoney(f1.fees) + ' over ' + f1.weeks + ' weeks leaves a net of ' + fmtMoney(f1.net) + ', ' + fmtMoney(f1.netPerHour) + ' an hour, ' + (f1.returnOnCapital * 100).toFixed(2) + '% on the deposit — verdict ' + f1.verdict + '.</p>'
       + '<h3>Live-token protocols set aside (top ' + DATA.live.length + ' by market cap)</h3>'
@@ -343,7 +344,7 @@
       + '<div class="panel"><h2>Evidence, compact</h2>'
       + '<p>Fit on ' + DATA.fit.n + ' comparables: log10(mcap) = ' + DATA.fit.intercept + ' + ' + DATA.fit.slope + ' × log10(TVL), R² ' + DATA.fit.r2 + '.</p>'
       + '<p>Held-out miss ×' + DATA.fit.looMiss + ' leave-one-out, ×' + DATA.fit.wfMiss + ' older-to-newer; flat median ×' + DATA.fit.flatLooMiss + ' / ×' + DATA.fit.flatWfMiss + '.</p>'
-      + '<p>Odds Brier ' + DATA.odds.logistic.brierLoo + ' leave-one-out vs cohort ' + DATA.odds.brierCohort + ' and base ' + DATA.odds.logistic.brierBase + ' — the logistic spreads the odds, it does not beat the cohorts.</p>'
+      + '<p>Odds Brier ' + DATA.odds.brier + ' leave-one-out vs base ' + DATA.odds.brierBase + ' — the odds are the age cohorts themselves, five values across the board.</p>'
       + '<p>Verdicts at the 10% pool: FARM ' + DATA.board.filter(function (r) { return r.farm.verdict === 'FARM'; }).length + ' · THIN ' + DATA.board.filter(function (r) { return r.farm.verdict === 'THIN'; }).length + ' · SKIP ' + DATA.board.filter(function (r) { return r.farm.verdict === 'SKIP'; }).length + '.</p>'
       + '</div></div></div>'
       + detailHtml()

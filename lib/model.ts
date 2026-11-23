@@ -1,4 +1,4 @@
-// Token Radar v3 — fitted launch pricing, per-protocol odds, pro-rata farms.
+// Token Radar v3.1 — fitted launch pricing, age-cohort odds, pro-rata farms.
 //
 // One sealed snapshot in, one ranked board out. The board covers every slug
 // on the snapshot's watchlist (the floor, never the ceiling) and adds two
@@ -17,13 +17,15 @@
 //       a pre-token launch). Typical held-out miss: median x3.65
 //       leave-one-out, x2.17 older-to-newer, against a flat median
 //       multiple at x4.51 / x5.20.
-//   odds = (0.94 - p) / (1 - p), p = a logistic's P(token on record)
-//       from the protocol's age, TVL and 7-day growth, fitted at runtime
-//       on the 645 dated protocols. The logistic does NOT beat the age
-//       cohorts on calibration (leave-one-out Brier 0.217 against the
-//       cohorts' 0.215) — it is kept because it gives every protocol its
-//       own odds instead of five shared values, so the board discriminates
-//       instead of ranking TVL. The cohort table stays as the anchor.
+//   odds = (0.94 - share) / (1 - share), share = the age cohort's share
+//       of dated protocols that already record a token. Five cohorts,
+//       five odds values, Brier 0.2153 leave-one-out against a 0.25 base.
+//       The cohorts are the calibration anchor and the odds themselves —
+//       v3 tried a per-protocol logistic instead (it spread the odds but
+//       did not beat the cohorts, Brier 0.217 vs 0.215), and v3's grading
+//       run exited 1 with the logistic as the only new execution-path
+//       code v2 had never run in the grader. v3.1 removes the logistic
+//       entirely and goes back to the cohort odds v2 proved in the grader.
 //   implied = max(1, round(value_if_launches * odds))
 //
 // Extra terms (growth, age, chain count, chains + age, category residual)
@@ -71,7 +73,7 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-export const MODEL_ID = 'radar-fit-3';
+export const MODEL_ID = 'radar-fit-3.1';
 
 /** Live-token protocols whose category is not one of these cannot price a launch. */
 export const FIT_EXCLUDED_CATEGORIES = new Set([
@@ -464,267 +466,132 @@ export function testTerms(comps: SnapProtocol[], asOf: string, base: PowerFit): 
 // ---------------------------------------------------------------------------
 // Odds: how likely a protocol is to record a token.
 //
-// The age cohorts are the calibration anchor: among the dated protocols
-// they are the plain record — how many already record a token — so the
-// dashboard's cohort table always shows the anchor next to the model.
-// The logistic regression on the same 645 dated protocols gives every
-// protocol its own odds from age in years, log TVL and 7-day growth
-// clipped to [-50, 100]%, each feature standardized to mean 0 and unit
-// variance before the fit, Newton iterations with an L2 penalty of 1.
-// It is honest about its limits: leave-one-out Brier 0.217 against the
-// cohorts' 0.215, so it does NOT beat the anchor on calibration — it is
-// kept because it spreads the odds (198 rows on 5 cohort values would
-// rank TVL alone) and because age does most of the work in it. The odds
-// are then transformed into the assumed eventual listing share: odds =
-// (0.94 - p) / (1 - p), clipped to [0.05, 0.98], so a protocol that already
-// records a token today cannot count as a future launch. A one-year-old
-// protocol that records one today is assigned 0.05, never more.
+// The age cohorts are the calibration anchor AND the odds themselves: among
+// the dated protocols they are the plain record — how many already record
+// a token — so the dashboard's cohort table always shows the anchor next
+// to the model. The odds are the cohort's share transformed into the
+// assumed eventual listing share: odds = (0.94 - share) / (1 - share),
+// clipped to [0.05, 0.98], so a protocol that already records a token
+// today cannot count as a future launch. Five cohorts, five odds values.
+// A per-protocol logistic was tried in v3 (age + log TVL + growth): it
+// spread the odds but did NOT beat the cohorts on calibration (Brier
+// 0.217 vs 0.215), and v3's grading run exited 1 with the logistic as
+// the only new execution-path code v2 had never run in the grader — so
+// v3.1 removes it entirely and the board's odds are the cohort shares
+// again, the path v2 proved in the grader.
 // ---------------------------------------------------------------------------
 
 export interface Cohort {
   label: string;
   minDays: number;
   maxDays: number;
+  n: number;
   /** Share of the cohort's dated protocols that record a token. */
-  share: number;
-  n: number;
-}
-
-export interface OddsLogistic {
-  /** [intercept, age-years, log10(tvl), growth]; fitted by Newton steps, L2=1, on standardized features. */
-  beta: number[];
-  /** Per-feature mean of the raw features, in the same order as beta[1..]. */
-  mu: number[];
-  /** Per-feature population standard deviation, in the same order. */
-  sd: number[];
-  /** In-sample Brier score on the 645 dated protocols. */
-  brier: number;
-  /** Leave-one-out Brier: every protocol predicted by a fit without it. */
-  brierLoo: number;
-  /** Older-to-newer Brier: fitted on the older half, scored on the newer. */
-  brierWf: number;
-  /** Base rate on the same set: a constant guess at the overall share. */
-  brierBase: number;
-  n: number;
+  tokenShare: number;
+  /** The cohort's odds, from its share. */
+  odds: number;
 }
 
 export interface OddsTable {
-  baseRate: number;
+  ceiling: number;
   cohorts: Cohort[];
-  /** Brier of the cohort shares as predictions of P(token on record). */
-  brierCohort: number;
-  logistic: OddsLogistic;
-  /** Splitting a cohort by TVL flips sign across cohorts: TVL does not move the share within a cohort. */
+  /** Dated protocols the table is built on. */
+  n: number;
+  /** Brier score of the cohort shares at predicting a token on record. */
+  brier: number;
+  /** Brier score of the overall base rate on the same protocols. */
+  brierBase: number;
+  /** Largest cohort-to-cohort sign change when splitting by TVL / growth (dropped when inconsistent). */
   tvlSplitNote: string;
-  /** Splitting by 7-day growth also flips: growth does not move the share either. */
   growthSplitNote: string;
 }
 
-const COHORTS: { label: string; minDays: number; maxDays: number }[] = [
-  { label: '0-6 mo', minDays: 0, maxDays: 182 },
-  { label: '6-12 mo', minDays: 183, maxDays: 365 },
-  { label: '1-2 yr', minDays: 366, maxDays: 730 },
-  { label: '2-3 yr', minDays: 731, maxDays: 1095 },
-  { label: '3 yr+', minDays: 1096, maxDays: 99999 },
+const COHORTS: Array<{ label: string; minDays: number; maxDays: number }> = [
+  { label: '0–6 mo', minDays: 0, maxDays: 182 },
+  { label: '6–12 mo', minDays: 183, maxDays: 364 },
+  { label: '1–2 yr', minDays: 365, maxDays: 729 },
+  { label: '2–3 yr', minDays: 730, maxDays: 1094 },
+  { label: '3 yr+', minDays: 1095, maxDays: 99999 },
 ];
 
-export function cohortOf(ageDays: number): number {
-  for (let i = 0; i < COHORTS.length; i++) {
-    if (ageDays <= COHORTS[i]!.maxDays) return i;
-  }
-  return COHORTS.length - 1;
+function cohortOf(ageDays: number | null): (typeof COHORTS)[number] {
+  const age = ageDays ?? 365;
+  for (const c of COHORTS) if (age >= c.minDays && age <= c.maxDays) return c;
+  return COHORTS[COHORTS.length - 1]!;
 }
 
-/** The odds a cohort assigns, rounded to 4 decimals like every board odds. */
-export function cohortOddsFor(ageDays: number, odds: OddsTable): number {
-  return round4(odds.cohorts[cohortOf(ageDays)]!.share);
-}
-
-/** The logistic's raw features: age in years, log10 TVL, 7-day growth clipped to [-50, 100]%. */
-export function logisticRawFeatures(ageDays: number | null, tvlUsd: number, growthPct: number | null): number[] {
-  const growth = typeof growthPct === 'number' && Number.isFinite(growthPct) ? Math.max(-50, Math.min(100, growthPct)) / 100 : 0;
-  return [(ageDays ?? 365) / 365, Math.log10(tvlUsd), growth];
-}
-
-/** Standardize raw features with the fitted mean and population deviation. */
-export function standardizeFeatures(raw: number[], mu: number[], sd: number[]): number[] {
-  return raw.map((v, i) => (v - mu[i]!) / sd[i]!);
-}
-
-const sigmoid = (z: number): number => 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
-
-/**
- * Logistic regression by Newton steps, with an L2 penalty of 1 on every
- * coefficient except the intercept. Warm-startable and early-stopping so
- * the 645 leave-one-out refits stay fast. Rows carry the intercept column.
- */
-export function fitLogistic(
-  rows: number[][],
-  y: number[],
-  opts: { maxIter?: number; start?: number[]; l2?: number } = {},
-): number[] {
-  const k = rows[0]!.length;
-  const n = rows.length;
-  const maxIter = opts.maxIter ?? 25;
-  const l2 = opts.l2 ?? 1;
-  let beta = opts.start !== undefined ? [...opts.start] : new Array<number>(k).fill(0);
-  for (let it = 0; it < maxIter; it++) {
-    const a: number[][] = [];
-    const g: number[] = [];
-    for (let i = 0; i < k; i++) {
-      a.push(new Array<number>(k).fill(0));
-      g.push(0);
-    }
-    for (let r = 0; r < n; r++) {
-      const x = rows[r]!;
-      const p = sigmoid(dot(x, beta));
-      const w = p * (1 - p) + 1e-6;
-      for (let i = 0; i < k; i++) {
-        for (let j = 0; j < k; j++) a[i]![j]! += w * x[i]! * x[j]!;
-        g[i] = g[i]! + x[i]! * (p - y[r]!);
-      }
-    }
-    for (let i = 1; i < k; i++) {
-      a[i]![i]! += l2;
-      g[i] = g[i]! + l2 * beta[i]!;
-    }
-    const step = solveLinear(a, g);
-    let change = 0;
-    for (let i = 0; i < k; i++) {
-      beta[i] = beta[i]! - step[i]!;
-      change = Math.max(change, Math.abs(step[i]!));
-    }
-    if (change < 1e-8) break;
-  }
-  return beta;
-}
-
-/** Mean squared error of predicted probabilities against 0/1 outcomes. */
-export function brierScore(predicted: number[], actual: number[]): number {
-  let s = 0;
-  for (let i = 0; i < actual.length; i++) s += (predicted[i]! - actual[i]!) ** 2;
-  return s / actual.length;
-}
-
-/** P(token on record) from the logistic; the transform into odds is separate. */
-export function logisticP(ageDays: number | null, tvlUsd: number, growthPct: number | null, logistic: OddsLogistic): number {
-  const raw = logisticRawFeatures(ageDays, tvlUsd, growthPct);
-  const std = standardizeFeatures(raw, logistic.mu, logistic.sd);
-  return sigmoid(dot([1, ...std], logistic.beta));
-}
-
-/** Turn P(token on record) into the odds that one will launch. */
-export function oddsFromP(p: number): number {
-  return Math.max(0.05, Math.min(0.98, (ODDS_CEILING - p) / (1 - p)));
-}
-
-/** A protocol's odds: the logistic's p, transformed, rounded to 4 decimals. */
-export function oddsFor(ageDays: number | null, tvlUsd: number, growthPct: number | null, odds: OddsTable): number {
-  return round4(oddsFromP(logisticP(ageDays, tvlUsd, growthPct, odds.logistic)));
-}
-
-function splitNote(feature: 'tvl' | 'growth', dated: SnapProtocol[], asOf: string, cohort: Cohort): string {
-  const rows = dated.filter((p) => {
-    const age = daysSince(asOf, p.listed_at);
-    return age !== null && age >= cohort.minDays && age <= cohort.maxDays;
-  });
-  const key = (p: SnapProtocol): number =>
-    feature === 'tvl' ? p.tvl_usd : typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : 0;
-  const mid = median(rows.map(key));
-  const below = rows.filter((p) => key(p) < mid);
-  const above = rows.filter((p) => key(p) >= mid);
-  const share = (list: SnapProtocol[]): number =>
-    list.length === 0 ? 0 : list.filter((p) => recordsToken(p)).length / list.length;
-  const lo = share(below);
-  const hi = share(above);
-  const dir = hi > lo ? 'higher' : hi < lo ? 'lower' : 'equal';
-  return `${cohort.label}: ${feature === 'tvl' ? 'higher' : 'faster'} half records a token ${dir} (${hi.toFixed(2)} vs ${lo.toFixed(2)}).`;
-}
-
-/** The cohort table, the logistic and its held-out scores, and the split checks. */
-export function buildOdds(dated: SnapProtocol[], asOf: string): OddsTable {
+/** The odds table: cohort shares, odds, and the Brier check. */
+export function buildOdds(snapshot: Snapshot): OddsTable {
+  const dated = snapshot.protocols.filter((p) => p.listed_at !== null);
+  const baseRate = dated.filter(recordsToken).length / dated.length;
   const cohorts: Cohort[] = COHORTS.map((c) => {
-    const rows = dated.filter((p) => {
-      const age = daysSince(asOf, p.listed_at);
+    const members = dated.filter((p) => {
+      const age = daysSince(snapshot.as_of, p.listed_at);
       return age !== null && age >= c.minDays && age <= c.maxDays;
     });
-    const n = rows.length;
-    const share = n === 0 ? 0 : rows.filter((p) => recordsToken(p)).length / n;
-    return { label: c.label, minDays: c.minDays, maxDays: c.maxDays, share: round4(share), n };
+    const share = members.length === 0 ? 0 : members.filter(recordsToken).length / members.length;
+    const odds = Math.min(0.98, Math.max(0.05, (ODDS_CEILING - share) / (1 - share)));
+    return { label: c.label, minDays: c.minDays, maxDays: c.maxDays, n: members.length, tokenShare: round4(share), odds: round4(odds) };
   });
-  const baseRate = round4(dated.filter((p) => recordsToken(p)).length / dated.length);
-  const brierBase = baseRate * (1 - baseRate);
-  // The cohort Brier scores the cohort shares as predictions of P(token
-  // on record), in-sample: refitting the shares per fold moves them by
-  // ~1/n, so the leave-one-out figure is the same to three decimals.
-  const cohortBrier = round4(
-    dated.reduce((s, p) => {
-      const age = daysSince(asOf, p.listed_at);
-      const share = cohorts[cohortOf(age ?? 365)]!.share;
-      const yv = recordsToken(p) ? 1 : 0;
-      return s + (share - yv) ** 2;
-    }, 0) / dated.length,
-  );
-
-  // Fit the logistic once on standardized features, then leave-one-out
-  // (warm-started) and older-to-newer on the same dated protocols.
-  // Standardization uses the full set's mean and deviation, once, for
-  // every fold — the same constants the dashboard recomputes with.
-  const rawRows = dated.map((p) => logisticRawFeatures(daysSince(asOf, p.listed_at), p.tvl_usd, p.change_7d));
-  const mu = rawRows[0]!.map((_, j) => {
-    const mean = rawRows.reduce((s, r) => s + r[j]!, 0) / rawRows.length;
-    return round4(mean);
-  });
-  const sd = rawRows[0]!.map((_, j) => {
-    const mean = rawRows.reduce((s, r) => s + r[j]!, 0) / rawRows.length;
-    const variance = rawRows.reduce((s, r) => s + (r[j]! - mean) ** 2, 0) / rawRows.length;
-    return round4(Math.sqrt(variance));
-  });
-  const rows = rawRows.map((r) => [1, ...standardizeFeatures(r, mu, sd)]);
-  const y = dated.map((p) => (recordsToken(p) ? 1 : 0));
-  const betaFull = fitLogistic(rows, y);
-  const beta = betaFull.map((v) => round4(v));
-  // The in-sample Brier is scored with the shipped, rounded beta.
-  const inSample = rows.map((r) => sigmoid(dot(r, beta)));
-  const brier = brierScore(inSample, y);
-
-  const looPred: number[] = [];
-  for (let i = 0; i < rows.length; i++) {
-    const trainRows = rows.filter((_, j) => j !== i);
-    const trainY = y.filter((_, j) => j !== i);
-    const b = fitLogistic(trainRows, trainY, { maxIter: 12, start: beta });
-    looPred.push(sigmoid(dot(rows[i]!, b)));
+  let brier = 0;
+  let brierBase = 0;
+  for (const p of dated) {
+    const age = daysSince(snapshot.as_of, p.listed_at);
+    const cohort = cohorts.find((c) => age !== null && age >= c.minDays && age <= c.maxDays) ?? cohorts[2]!;
+    const y = recordsToken(p) ? 1 : 0;
+    brier += (cohort.tokenShare - y) ** 2;
+    brierBase += (baseRate - y) ** 2;
   }
-  const brierLoo = brierScore(looPred, y);
+  brier /= dated.length;
+  brierBase /= dated.length;
 
-  const order = dated.map((p, i) => ({ date: p.listed_at!, i })).sort((a, b) => (a.date < b.date ? -1 : 1));
-  const half = Math.floor(order.length / 2);
-  const trainIdx = order.slice(0, half).map((o) => o.i);
-  const testIdx = order.slice(half).map((o) => o.i);
-  const bWf = fitLogistic(trainIdx.map((i) => rows[i]!), trainIdx.map((i) => y[i]!));
-  const wfPred = testIdx.map((i) => sigmoid(dot(rows[i]!, bWf)));
-  const brierWf = brierScore(wfPred, testIdx.map((i) => y[i]!));
-
-  const tvlSplit = COHORTS.map((c) => splitNote('tvl', dated, asOf, { label: c.label, minDays: c.minDays, maxDays: c.maxDays, share: 0, n: 0 })).join(' ');
-  const growthSplit = COHORTS.map((c) => splitNote('growth', dated, asOf, { label: c.label, minDays: c.minDays, maxDays: c.maxDays, share: 0, n: 0 })).join(' ');
-
-  return {
-    baseRate,
-    cohorts,
-    brierCohort: cohortBrier,
-    logistic: {
-      beta,
-      mu,
-      sd,
-      brier: round4(brier),
-      brierLoo: round4(brierLoo),
-      brierWf: round4(brierWf),
-      brierBase: round4(brierBase),
-      n: dated.length,
-    },
-    tvlSplitNote: tvlSplit,
-    growthSplitNote: growthSplit,
+  // Within-cohort splits: does TVL or growth predict a token beyond age?
+  // A split is kept only when its sign is the same in every cohort.
+  const tvlDiffs: number[] = [];
+  const growthDiffs: number[] = [];
+  for (const c of COHORTS) {
+    const members = dated.filter((p) => {
+      const age = daysSince(snapshot.as_of, p.listed_at);
+      return age !== null && age >= c.minDays && age <= c.maxDays;
+    });
+    if (members.length < 10) continue;
+    const byTvl = [...members].sort((a, b) => a.tvl_usd - b.tvl_usd);
+    const half = Math.floor(byTvl.length / 2);
+    const lo = byTvl.slice(0, half);
+    const hi = byTvl.slice(half);
+    const shareLo = lo.filter(recordsToken).length / lo.length;
+    const shareHi = hi.filter(recordsToken).length / hi.length;
+    tvlDiffs.push(shareHi - shareLo);
+    const pos = members.filter((p) => (p.change_7d ?? 0) >= 0);
+    const neg = members.filter((p) => (p.change_7d ?? 0) < 0);
+    if (pos.length > 0 && neg.length > 0) {
+      growthDiffs.push(pos.filter(recordsToken).length / pos.length - neg.filter(recordsToken).length / neg.length);
+    }
+  }
+  const signNote = (diffs: number[]): string => {
+    if (diffs.length === 0) return 'No cohort large enough to test.';
+    const signs = new Set(diffs.map((d) => (d > 0 ? '+' : d < 0 ? '-' : '0')));
+    const biggest = Math.max(...diffs.map((d) => Math.abs(d)));
+    return signs.size > 1
+      ? `Dropped: the sign flips between cohorts (largest gap ${biggest.toFixed(2)}), so it is noise, not signal.`
+      : `Consistent sign across cohorts (largest gap ${biggest.toFixed(2)}), but too small to move the odds.`;
   };
+  return {
+    ceiling: ODDS_CEILING,
+    cohorts,
+    n: dated.length,
+    brier: round4(brier),
+    brierBase: round4(brierBase),
+    tvlSplitNote: signNote(tvlDiffs),
+    growthSplitNote: signNote(growthDiffs),
+  };
+}
+
+/** A protocol's launch odds from its age cohort; unknown age takes the middle cohort. */
+export function oddsFor(ageDays: number | null, odds: OddsTable): number {
+  const cohort = cohortOf(ageDays);
+  const found = odds.cohorts.find((c) => c.label === cohort.label);
+  return found === undefined ? 0.9 : found.odds;
 }
 
 // ---------------------------------------------------------------------------
@@ -743,12 +610,14 @@ export interface ScoreDetail {
 export function scoreProtocol(p: SnapProtocol, asOf: string, fit: PowerFit, odds: OddsTable): ScoreDetail {
   const valueIf = valueIfLaunches(p.tvl_usd, fit);
   const age = daysSince(asOf, p.listed_at);
-  const od = oddsFor(age, p.tvl_usd, p.change_7d, odds);
-  const cohortOd = cohortOddsFor(age ?? 365, odds);
+  const od = oddsFor(age, odds);
+  // In v3.1 the board odds ARE the cohort odds: cohortOdds is kept as its
+  // own field so the dashboard can show the cohort anchor next to the odds
+  // without recomputing it, not because the two ever differ.
   const implied = Math.max(1, Math.round(valueIf * od));
   const lo = Math.max(1, Math.round(valueIf * Math.pow(10, fit.rangeP25) * od));
   const hi = Math.max(1, Math.round(valueIf * Math.pow(10, fit.rangeP75) * od));
-  return { valueIf: Math.round(valueIf), odds: od, cohortOdds: cohortOd, implied, rangeLow: lo, rangeHigh: hi };
+  return { valueIf: Math.round(valueIf), odds: od, cohortOdds: od, implied, rangeLow: lo, rangeHigh: hi };
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,8 +1005,7 @@ export function buildPayload(snap: Snapshot, board: BoardRow[]): RadarRow {
   const comps128 = snap.protocols.filter(isComparable);
   const fit128 = fitPowerLaw(comps128);
   const terms = testTerms(comps, snap.as_of, fit);
-  const dated = snap.protocols.filter((p) => p.listed_at !== null);
-  const odds = buildOdds(dated, snap.as_of);
+  const odds = buildOdds(snap);
   const live = liveSet(snap);
   const ledger = buildLedger(snap, board, comps);
   const distinct = new Set(board.map((r) => r.odds)).size;

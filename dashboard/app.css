@@ -1,4 +1,4 @@
-/* Token Radar v3 — dark terminal theme. Cover first: one-line headline,
+/* Token Radar v3.1 — dark terminal theme. Cover first: one-line headline,
    ledger bar, one-row KPI strip, then the board beside a narrow rail with
    the scatter and the compact evidence. */
 :root {
@@ -116,6 +116,10 @@ td .sub2 { display: block; font-size: 11.5px; color: var(--muted); }
 .evidence .num { white-space: nowrap; }
 ol.steps { margin: 6px 0; padding-left: 20px; }
 ol.steps li { margin: 4px 0; }
+/* The model card is injected into index.html by main.ts at build time:
+   one section of literal headline numbers, so the dossier's text carries
+   the fit, the odds and the totals. It sits below the evidence, after the
+   footer flow, so it never pushes the board off the cover. */
 .model-card {
   border-top: 1px solid var(--line);
   margin-top: 24px;

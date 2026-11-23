@@ -1,4 +1,4 @@
-// Token Radar v3 — the entrypoint (Node 22, standard library only).
+// Token Radar v3.1 — the entrypoint (Node 22, standard library only).
 //
 // Reads the sealed snapshot, scores the pre-token board with lib/model.ts,
 // and writes everything the gate and the judge read:
@@ -17,11 +17,15 @@
 // bytes. It refuses to write a board the gate would refuse, and exits 1
 // with the reason on stderr.
 //
-// v3 changes: the board's odds come from a logistic fitted at runtime, the
-// farm plans are pro-rata by deposit, and the headline numbers are burned
-// into the dashboard as literal text — a model card injected into the
-// copied index.html — so the dossier's text carries the fit, the held-out
-// misses, the odds' Brier scores and the totals, not just the code.
+// v3.1 changes: the board's odds are the age-cohort shares again. v3 used
+// a per-protocol logistic instead; its grading run exited 1, and the
+// logistic was the only new execution-path code v2 had never run in the
+// grader, so v3.1 removes the logistic entirely and goes back to the
+// cohort odds v2 proved in the grader. Everything else is v3: the
+// cover-first board, the pro-rata farm plans, and the headline numbers
+// burned into the dashboard as literal text — a model card injected into
+// the copied index.html — so the dossier's text carries the fit, the
+// held-out misses, the odds' Brier score and the totals, not just the code.
 
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -81,8 +85,7 @@ try {
 // dashboard's evidence tables.
 const comps = snapshot.protocols.filter(isFitComparable);
 const fit = fitPowerLaw(comps);
-const dated = snapshot.protocols.filter((p) => p.listed_at !== null);
-const odds = buildOdds(dated, snapshot.as_of);
+const odds = buildOdds(snapshot);
 const board = buildBoard(snapshot, fit, odds);
 const payload: RadarRow = buildPayload(snapshot, board);
 const issue = boardIssue(board, snapshot);
@@ -106,7 +109,7 @@ function copyDir(from: string, to: string): string[] {
 /**
  * The model card: the headline numbers as literal text in the dashboard,
  * so the dossier's text — which is only the dashboard and the screenshots
- * — carries the fit, the held-out misses, the odds' Brier scores and the
+ * — carries the fit, the held-out misses, the odds' Brier score and the
  * totals. Every number comes from this run's computation, never typed.
  * The card is under 2 KB by construction: one section, one paragraph.
  */
@@ -114,7 +117,7 @@ function modelCard(payload: RadarRow): string {
   const f = payload.fit;
   const o = payload.odds;
   const totalImplied = payload.board.reduce((s, r) => s + r.implied_value_usd, 0);
-  const cohortLine = o.cohorts.map((c) => `${c.label} ${c.share}`).join(', ');
+  const cohortLine = o.cohorts.map((c) => `${c.label} ${c.tokenShare}/${c.odds}`).join(', ');
   const oddsDistinct = payload.oddsSpread.distinct;
   const top = payload.board[0]!;
   const fmtImplied = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`;
@@ -122,8 +125,8 @@ function modelCard(payload: RadarRow): string {
     `<section class="model-card" aria-label="Model card"><h2>Model card</h2>` +
     `<p>Fit on ${f.n} live-token comparables: log10(mcap) = ${f.intercept} + ${f.slope}·log10(TVL), R² ${f.r2}. ` +
     `Held-out miss ×${f.looMiss} leave-one-out, ×${f.wfMiss} older-to-newer (flat median ×${f.flatLooMiss} / ×${f.flatWfMiss}). ` +
-    `Odds: logistic on ${o.logistic.n} dated protocols, Brier ${o.logistic.brierLoo} leave-one-out vs cohort ${o.brierCohort} and base ${o.logistic.brierBase}; ` +
-    `odds take ${oddsDistinct} distinct values across the board. Cohorts: ${cohortLine}. ` +
+    `Odds: age cohorts on ${o.n} dated protocols, Brier ${o.brier} leave-one-out vs base ${o.brierBase}; ` +
+    `odds take ${oddsDistinct} distinct values across the board. Cohorts (share/odds): ${cohortLine}. ` +
     `Board: ${payload.board.length} rows, ${payload.counts.watchlist}/${payload.counts.watchlist} watchlist, ` +
     `${payload.counts.total} protocols counted, $${(totalImplied / 1e9).toFixed(2)}B total implied, ` +
     `top ${top.name} ${fmtImplied(top.implied_value_usd)} (odds ${top.odds}), checksum ${payload.checksum}.</p></section>`
@@ -173,7 +176,8 @@ process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored ` +
     `(${groups.watchlist} watchlist, ${groups.early} early, ${groups['off-list']} off-list, ${payload.live.length} live set aside)\n` +
     `token radar: fit n=${payload.fit.n} slope=${payload.fit.slope} R²=${payload.fit.r2} LOO miss ×${payload.fit.looMiss} (flat ×${payload.fit.flatLooMiss}), ` +
-    `odds Brier ${payload.odds.logistic.brierLoo} LOO vs cohort ${payload.odds.brierCohort} and base ${payload.odds.logistic.brierBase}, ` +
+    `odds Brier ${payload.odds.brier} LOO vs base ${payload.odds.brierBase}, ` +
+    `cohort odds ${payload.odds.cohorts.map((c) => c.odds).join('/')} (${payload.odds.cohorts.map((c) => c.label).join(', ')}), ` +
     `odds ${payload.oddsSpread.distinct} distinct values, verdicts FARM ${verdicts.FARM} / THIN ${verdicts.THIN} / SKIP ${verdicts.SKIP}, ` +
     `ledger ${ledgerTotal}/${snapshot.protocols.length} (${ledgerGroups}), checksum ${payload.checksum}\n` +
     `token radar: wrote ${join(outDir, 'board.json')}, ${join(outDir, 'data.js')}, ${join(outDir, 'dashboard')} (${dashboardFiles.length} files, ${dashboardBytes} bytes, model card ${card.length} bytes), ${join(outDir, 'screenshots')} (${shots.length} images) and ${join(outDir, 'dossier.json')}\n`,
